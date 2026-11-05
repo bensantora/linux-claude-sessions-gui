@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""GUI picker for Claude Code sessions across all folders (uses yad).
+
+  claude-sessions                  open the picker
+  claude-sessions --list           print sessions as text (date, folder, title, id)
+  claude-sessions --label ID TEXT  set a title for a session (empty TEXT clears it)
+  claude-sessions --trash-list     list trashed sessions (date, id, title)
+  claude-sessions --restore ID     put a trashed session back (never overwrites)
+  claude-sessions --purge-trash [DAYS]  permanently delete trash (all, or older than DAYS)
+
+Picker: double-click a row (or select it + Resume) to open it in a new terminal;
+Describe sets your own title; Delete moves a session to the trash
+(~/.local/share/claude-sessions/trash, nothing is erased until --purge-trash).
+Titles are shown as: your description > Claude's /rename > auto-title (marked
+with a diamond) > first message. Your descriptions live in LABELS below.
+"""
+import datetime, glob, json, os, re, shlex, shutil, subprocess, sys
+
+HOME = os.path.expanduser("~")
+CLAUDE_DIR = f"{HOME}/.claude"
+PROJECTS = f"{CLAUDE_DIR}/projects"
+LABELS = f"{HOME}/.config/claude-sessions/labels.json"
+TRASH = f"{HOME}/.local/share/claude-sessions/trash"   # deleted sessions wait here
+SELFILE = f"{HOME}/.cache/claude-sessions.sel"   # row currently selected in the picker
+TITLE_MIN = 40                                   # minimum Title column width (characters)
+TERMINAL = "gnome-terminal"                      # detected on this machine
+UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}")
+MISSING = "  [missing]"
+SCALE = "1.3"                                    # text scale for yad windows (GDK_DPI_SCALE); 1.0 = normal
+YAD_ENV = {**os.environ, "GDK_DPI_SCALE": SCALE}                       # for yad windows
+TERM_ENV = {k: v for k, v in os.environ.items() if k != "GDK_DPI_SCALE"}  # terminal must not inherit it
+
+# --- your descriptions ------------------------------------------------------
+
+def load_labels():
+    try:
+        with open(LABELS) as f: return json.load(f)
+    except (OSError, ValueError): return {}
+
+def set_label(sid, text):
+    labels = load_labels()
+    text = " ".join(text.split())
+    if text: labels[sid] = text
+    else: labels.pop(sid, None)
+    os.makedirs(os.path.dirname(LABELS), exist_ok=True)
+    tmp = LABELS + ".tmp"
+    with open(tmp, "w") as f: json.dump(labels, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, LABELS)
+
+# --- actions ----------------------------------------------------------------
+
+def open_session(folder, sid):
+    """Open a new terminal in `folder` running `claude --resume sid`."""
+    if not UUID.fullmatch(sid):
+        return
+    if not os.path.isdir(folder):
+        subprocess.Popen(["yad", "--error", "--title=Claude Sessions", "--center",
+                          f"--text=Folder no longer exists:\n{folder}\n\n"
+                          "Recreate it (or move it back) to resume this session."],
+                         env=YAD_ENV)
+        return
+    # The terminal's shell may lack ~/.local/bin on PATH, so pass claude's full path.
+    claude = shutil.which("claude") or f"{HOME}/.local/bin/claude"
+    cmd = ('cd "$1" && "$3" --resume "$2"; '
+           'echo; echo "[claude exited - press Enter to close]"; read _')
+    subprocess.Popen([TERMINAL, "--", "bash", "-lc", cmd, "_", folder, sid, claude],
+                     start_new_session=True, env=TERM_ENV)
+
+def session_paths(sid):
+    """Everything on disk that belongs to a session (absolute paths)."""
+    cands = (glob.glob(f"{PROJECTS}/*/{sid}.jsonl") + glob.glob(f"{PROJECTS}/*/{sid}")
+             + [f"{CLAUDE_DIR}/file-history/{sid}", f"{CLAUDE_DIR}/session-env/{sid}"])
+    return [p for p in cands if os.path.exists(p)]
+
+def trash_session(sid):
+    """Move a session (transcripts, per-session folders, label) into the trash.
+    Returns None on success, else an error string. Nothing is lost on failure."""
+    if not UUID.fullmatch(sid):
+        return "bad session id"
+    paths = session_paths(sid)
+    if not paths:
+        return "nothing found for this session"
+    dest = f"{TRASH}/{sid}"
+    if os.path.exists(dest):                     # trashed before, restored, trashed again
+        dest += "." + datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    data = dest + "/data"
+    rels = [os.path.relpath(p, CLAUDE_DIR) for p in paths]
+    try:
+        os.makedirs(data, mode=0o700, exist_ok=True)
+        meta = dict(sid=sid, trashed=datetime.datetime.now().isoformat(timespec="seconds"),
+                    label=load_labels().get(sid, ""), items=rels)
+        with open(dest + "/meta.json", "w") as f: json.dump(meta, f, indent=1, ensure_ascii=False)
+        done = []
+        try:
+            for rel in rels:
+                os.makedirs(os.path.dirname(f"{data}/{rel}"), exist_ok=True)
+                shutil.move(f"{CLAUDE_DIR}/{rel}", f"{data}/{rel}")
+                done.append(rel)
+        except OSError as e:                     # roll back whatever already moved
+            for rel in done:
+                try: shutil.move(f"{data}/{rel}", f"{CLAUDE_DIR}/{rel}")
+                except OSError: pass
+            shutil.rmtree(dest, ignore_errors=True)
+            return f"could not move to trash: {e}"
+    except OSError as e:
+        shutil.rmtree(dest, ignore_errors=True)
+        return f"could not create trash entry: {e}"
+    set_label(sid, "")
+    return None
+
+def trash_entries():
+    """Trashed sessions as meta dicts (with 'dir'), newest first."""
+    out = []
+    for m in glob.glob(f"{TRASH}/*/meta.json"):
+        try:
+            with open(m) as f: d = json.load(f)
+            d["dir"] = os.path.dirname(m)
+            out.append(d)
+        except (OSError, ValueError): continue
+    return sorted(out, key=lambda d: d.get("trashed", ""), reverse=True)
+
+def restore_session(ref):
+    """Restore a trashed session (ref = session id, or trash folder name). Returns None or error."""
+    entry = next((d for d in trash_entries()
+                  if ref in (d.get("sid"), os.path.basename(d["dir"]))), None)
+    if not entry:
+        return "not found in trash"
+    pairs = [(f"{entry['dir']}/data/{rel}", os.path.normpath(f"{CLAUDE_DIR}/{rel}"))
+             for rel in entry.get("items", [])]
+    if any(not d.startswith(CLAUDE_DIR + "/") for _, d in pairs):
+        return "trash entry has unsafe paths; not restoring"
+    clash = [d for _, d in pairs if os.path.exists(d)]
+    if clash:
+        return "already exists, not overwriting: " + ", ".join(clash)
+    done = []
+    try:
+        for src, dst in pairs:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+            done.append((src, dst))
+    except OSError as e:
+        for src, dst in done:
+            try: shutil.move(dst, src)
+            except OSError: pass
+        return f"restore failed: {e}"
+    if entry.get("label"): set_label(entry["sid"], entry["label"])
+    shutil.rmtree(entry["dir"], ignore_errors=True)
+    return None
+
+def purge_trash(days=None):
+    """Permanently delete trash entries (all, or only those older than `days`)."""
+    cutoff = None if days is None else datetime.datetime.now() - datetime.timedelta(days=days)
+    n = 0
+    for d in trash_entries():
+        try: when = datetime.datetime.fromisoformat(d.get("trashed", ""))
+        except ValueError: when = datetime.datetime.min
+        if cutoff is None or when < cutoff:
+            shutil.rmtree(d["dir"], ignore_errors=True); n += 1
+    return n
+
+# --- reading sessions -------------------------------------------------------
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                return b.get("text", "")
+    return ""
+
+def clean(t):
+    t = re.sub(r"<(system-reminder|local-command-\w+)>.*?</\1>", "", t, flags=re.S)
+    t = re.sub(r"</?pasted_content[^>]*>", "", t).strip()
+    m = re.search(r"<command-name>(.*?)</command-name>", t)
+    return "(command) " + m.group(1) if m else t
+
+def one_line(t):
+    return " ".join((t or "").split())
+
+def scan(path):
+    """Read one transcript: first cwd, first human message, auto-title, /rename, last prompt."""
+    r = dict(cwd=None, first=None, ai=None, custom=None, last=None)
+    with open(path, errors="replace") as f:
+        for line in f:
+            if '"ai-title"' in line or '"last-prompt"' in line or '"custom-title"' in line:
+                try: d = json.loads(line)
+                except ValueError: continue
+                t = d.get("type")
+                if t == "ai-title" and d.get("aiTitle"): r["ai"] = d["aiTitle"]
+                elif t == "custom-title" and d.get("customTitle"): r["custom"] = d["customTitle"]
+                elif t == "last-prompt" and d.get("lastPrompt"): r["last"] = clean(d["lastPrompt"])
+            elif (r["cwd"] is None and '"cwd"' in line) or (r["first"] is None and '"user"' in line):
+                try: d = json.loads(line)
+                except ValueError: continue
+                if r["cwd"] is None and d.get("cwd"): r["cwd"] = d["cwd"]
+                if (r["first"] is None and d.get("type") == "user" and not d.get("isMeta")
+                        and not d.get("isSidechain")):
+                    t = clean(text_of(d.get("message", {}).get("content")).strip())
+                    if t: r["first"] = t
+    return r
+
+def collect_raw():
+    """All sessions, newest first, as dicts including the best available title."""
+    best = {}
+    for p in glob.glob(PROJECTS + "/*/*.jsonl"):
+        sid = os.path.basename(p)[:-6]
+        r = scan(p)
+        if not r["cwd"]: continue
+        # a session can appear in two project dirs; prefer the one matching its folder
+        enc = re.sub(r"[^A-Za-z0-9]", "-", r["cwd"])
+        key = (os.path.basename(os.path.dirname(p)) == enc, os.path.getmtime(p))
+        if sid not in best or key > best[sid][0]:
+            best[sid] = (key, r)
+    labels = load_labels()
+    out = []
+    for sid, ((_, mt), r) in sorted(best.items(), key=lambda kv: kv[1][0][1], reverse=True):
+        label, custom, ai = one_line(labels.get(sid)), one_line(r["custom"]), one_line(r["ai"])
+        first = one_line(r["first"]) or "(no message)"
+        out.append(dict(sid=sid, mtime=mt, cwd=r["cwd"], first=first, last=one_line(r["last"]),
+                        title=label or custom or ai or first,
+                        auto=not (label or custom), label=label, custom=custom, ai=ai))
+    return out
+
+def find(sid):
+    return next((x for x in collect_raw() if x["sid"] == sid), None)
+
+def collect():
+    """Rows for the picker: date, folder, title, session id, hidden search text."""
+    for r in collect_raw():
+        when = datetime.datetime.fromtimestamp(r["mtime"]).strftime("%Y-%m-%d %H:%M")
+        cwd = r["cwd"]
+        folder = "~" + cwd[len(HOME):] if cwd.startswith(HOME) else cwd
+        if not os.path.isdir(cwd): folder += MISSING
+        title = ("◇ " if r["auto"] else "") + r["title"][:70]
+        title = title.ljust(TITLE_MIN, " ")      # pad: keeps a minimum column width
+        yield (when, folder, title, r["sid"],
+               f"{r['label']} {r['custom']} {r['ai']} {folder} {r['first']} {r['last']} {r['sid']}")
+
+# --- picker -----------------------------------------------------------------
+
+def markup(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;")
+
+def trash_title(d):
+    """Best title for a trashed session: your label, else read from its trashed transcript."""
+    if d.get("label"): return d["label"]
+    for p in glob.glob(f"{d['dir']}/data/projects/*/*.jsonl"):
+        try:
+            r = scan(p)
+            return one_line(r["custom"]) or one_line(r["ai"]) or one_line(r["first"]) or "(no message)"
+        except OSError: pass
+    return "(unknown)"
+
+def trash_dialog():
+    """List trashed sessions; Restore puts one back, Delete forever removes it for good."""
+    while True:
+        ents = trash_entries()
+        rows = [c for d in ents for c in (d.get("trashed", "").replace("T", " ")[:16],
+                                          trash_title(d)[:70].ljust(TITLE_MIN, " "),
+                                          d.get("sid", ""), os.path.basename(d["dir"]))]
+        cmd = ["yad", "--list", "--title=Claude Sessions - Trash", "--width=1000", "--height=500",
+               "--center", "--hide-column=4", "--print-column=4", "--expand-column=2",
+               "--button=Restore:2", "--button=Delete forever:3", "--button=Back:0",
+               "--text=Trashed sessions.   Select a row + Restore / Delete forever.",
+               "--column=Trashed", "--column=Title", "--column=Session ID", "--column=dir"]
+        r = subprocess.run(cmd, input="\n".join(rows) + "\n" if rows else "", text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=YAD_ENV)
+        if r.returncode not in (2, 3):
+            return
+        ref = r.stdout.strip().strip("|").strip()
+        entry = next((d for d in ents if os.path.basename(d["dir"]) == ref), None)
+        if not entry:
+            subprocess.run(["yad", "--info", "--center", "--text=Select a row first."], env=YAD_ENV)
+            continue
+        if r.returncode == 2:
+            err = restore_session(ref)
+            if err:
+                subprocess.run(["yad", "--error", "--center", "--text=" + markup(err)], env=YAD_ENV)
+        else:
+            q = subprocess.run(["yad", "--question", "--center", "--title=Delete forever",
+                                "--button=Cancel:1", "--button=Delete forever:0",
+                                "--text=Permanently delete this trashed session?\n"
+                                "This cannot be undone.\n\n" + markup(trash_title(entry))],
+                               env=YAD_ENV)
+            if q.returncode == 0:
+                shutil.rmtree(entry["dir"], ignore_errors=True)
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["--open"]:                  # yad double-click callback (row columns follow)
+        a = [x.strip("'\"") for x in args[1:]]
+        sid = next((x for x in a if UUID.fullmatch(x)), "")
+        folder = a[1].replace(MISSING, "")
+        if folder.startswith("~"): folder = HOME + folder[1:]
+        return open_session(folder, sid)
+    if args[:1] == ["--sel"]:                   # yad row-selected callback: remember the row
+        m = next((UUID.search(x) for x in args[1:] if UUID.search(x)), None)
+        if m:
+            os.makedirs(os.path.dirname(SELFILE), exist_ok=True)
+            with open(SELFILE, "w") as f: f.write(m.group(0))
+        return
+    if args[:1] == ["--list"]:
+        for r in collect(): print("\t".join(r[:4]))
+        return
+    if args[:1] == ["--label"] and len(args) >= 2:
+        return set_label(args[1], " ".join(args[2:]))
+    if args[:1] == ["--trash-list"]:
+        for d in trash_entries():
+            print(d.get("trashed", ""), d.get("sid", ""), d.get("label", ""), sep="\t")
+        return
+    if args[:1] == ["--restore"] and len(args) == 2:
+        err = restore_session(args[1])
+        print(err or "restored"); return sys.exit(1 if err else 0)
+    if args[:1] == ["--purge-trash"]:
+        days = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+        print(f"permanently deleted {purge_trash(days)} trashed session(s)"); return
+
+    me = shlex.quote(os.path.realpath(__file__))
+    while True:
+        try: os.remove(SELFILE)
+        except OSError: pass
+        rows = [c for r in collect() for c in r]
+        cmd = ["yad", "--list", "--title=Claude Sessions", "--width=1200", "--height=600",
+               "--center", "--search-column=5", "--hide-column=5", "--expand-column=0",
+               f"--select-action={me} --sel", f"--dclick-action={me} --open",
+               "--button=Describe:2", "--button=Resume:4", "--button=Delete:3",
+               "--button=Trash:5", "--button=Close:0",
+               "--text=Double-click = resume.   Select a row + Describe / Resume / Delete.   "
+               "◇ = auto title.   Type to search.",
+               "--column=Last Used", "--column=Folder", "--column=Title",
+               "--column=Session ID", "--column=search"]
+        r = subprocess.run(cmd, input="\n".join(rows) + "\n", text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=YAD_ENV)
+        if r.returncode not in (2, 3, 4, 5):    # Close, Esc, or window closed
+            return
+        if r.returncode == 5:                   # Trash viewer (needs no selected row)
+            trash_dialog()
+            continue
+        try: m = UUID.search(open(SELFILE).read())
+        except OSError: m = None
+        info = find(m.group(0)) if m else None
+        if not info:
+            subprocess.run(["yad", "--info", "--center", "--text=Select a row first."], env=YAD_ENV)
+            continue
+        sid = info["sid"]
+        if r.returncode == 4:                   # Resume
+            open_session(info["cwd"], sid)
+        elif r.returncode == 3:                 # Delete
+            detail = f"{info['cwd']}\n{info['title']}\nStarted: {info['first'][:80]}\n{sid}"
+            q = subprocess.run(["yad", "--question", "--center", "--title=Delete session",
+                                "--button=Cancel:1", "--button=Move to trash:0",
+                                "--text=Move this session to the trash?\n"
+                                "Restore with: claude-sessions --restore ID\n\n"
+                                + markup(detail)], env=YAD_ENV)
+            if q.returncode == 0:
+                err = trash_session(sid)
+                if err:
+                    subprocess.run(["yad", "--error", "--center", "--text=" + markup(err)],
+                                   env=YAD_ENV)
+        else:                                   # Describe (pre-filled with the current title)
+            e = subprocess.run(["yad", "--entry", "--title=Describe session", "--center",
+                                "--width=600", f"--entry-text={info['title']}",
+                                f"--text=Title for session {sid[:8]}  "
+                                "(empty = go back to Claude's own name):"],
+                               stdout=subprocess.PIPE, text=True, env=YAD_ENV)
+            if e.returncode == 0: set_label(sid, e.stdout.strip())
+
+main()
